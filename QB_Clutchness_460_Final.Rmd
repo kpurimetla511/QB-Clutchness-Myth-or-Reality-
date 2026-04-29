@@ -1,0 +1,856 @@
+---
+title: 'QB Clutchness: Myth or Reality?'
+author: "Saraj Dhillon, Krishna Purimetla, & Mahi Saraf"
+date: "04/28/2026"
+output:
+  pdf_document:
+    latex_engine: xelatex
+  html_document:
+    df_print: paged
+classoption: oneside
+header-includes:
+- \usepackage{xcolor}
+- \pagecolor{white}
+---
+
+# Abstract
+
+NFL fans have debated for decades whether quarterbacks exhibit a true, repeatable “clutch” gene or if that label is just a story told after the fact. By analyzing play-by-play data from the nflreadr package across the 2010–2025 seasons, we sought to tackle this question. We define clutch situations based on game-level factors such as score differential, time remaining, down, and win probability. We also evaluate performance using three complementary modeling approaches: a multi-level logistic model of pass completion, a GAM-based framework using Yards Over Sticks and Conversion Success, and a hierachical EPA based model.  Our combined work allows us to evaluate clutch performance from multiple perspectives such as accuracy, value, and contextual success while also controlling for play context and isolating player-specific effects. Ultimately, this analysis aimed to determine whether clutch performance is a persistent skill at the quarterback level or primarily driven by randomness. Overall through our methods we find consistent evidence of a negative average clutch effect across all quarterbacks (though relatively small), with solid evidence that this effect varies between different quarterbacks.
+
+\pagebreak
+
+# Introduction
+
+Is clutch a real phenomenon, or do we label quarterbacks as “clutch” only after strong performances in high-pressure moments? This question sits at the intersection of sports analytics and fan perception. Clutch performance is often associated with late-game drives, third downs, and other high-leverage situations, but it remains unclear whether quarterbacks systematically perform differently under pressure. We investigate whether quarterback performance changes in high-pressure versus low-pressure situations, and whether certain quarterbacks consistently outperform others in these moments. Answering this question has practical implications for team decision-making, including contract valuation and roster construction.
+
+To address this, we analyze clutch performance using three complementary approaches: a multilevel logistic model for pass completion, a GAM framework for situational passing efficiency, and a hierarchical EPA model for overall play value. Across all three models, we find consistent evidence that quarterbacks, on average, perform worse in high-pressure situations. The logistic model shows reduced completion probabilities, while the GAM indicates lower conversion rates and efficiency. The EPA model similarly finds declines in overall performance, though with meaningful variation across players. While a few quarterbacks appear relatively more resilient under pressure, these estimates carry substantial uncertainty. Overall, our results suggest that “clutch” performance is not a generalizable trait, but rather varies modestly across individuals and contexts.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(nflreadr)
+library(purrr)
+library(broom)
+library(knitr)
+library(lme4)
+library(broom.mixed)
+library(mgcv)
+
+knitr::opts_chunk$set(
+  fig.bg = "white"
+)
+
+theme_set(
+  theme_minimal(base_family = "serif")
+)
+```
+
+# Data & EDA
+
+Our data comes from the nflreadr package, an open-source R package that provides access to detailed NFL play-by-play data. We pulled all passing plays across the 2010–2025 seasons, and filtered to plays from quarterbacks with at least 20 clutch and 50 non-clutch passing attempts for stable estimates. In our approach, we defined clutch in a specific manner, despite there being a considerable amount of discourse on a definition. We assigned our plays to be clutch if and only if they took place when it was a one-score game (within 8 points), in the 4th quarter or final 150 seconds of the 2nd quarter, win probability between 0.2 and 0.8, and during a 3rd or 4th down "make-or-break" situation. Key variables in our dataset include EPA, completion indicator, yards gained, yards to go, air yards, down, quarter, score differential, win probability, field position, and opposing defensive team. When taken together, these variables capture both the outcome and context of every passing play in our sample.
+
+```{r, echo=FALSE, message=FALSE, cache=TRUE}
+#IMPORTS SEASON BY SEASON TO AVOID MEMORY ISSUES
+data = map_dfr(2010:2025, function(season) {
+  load_pbp(season) %>%
+    filter(
+      pass == 1,
+      !is.na(passer_player_name),
+      !is.na(passer_player_id),
+      !is.na(epa),
+      !is.na(yards_gained),
+      !is.na(ydstogo),
+      !is.na(score_differential),
+      !is.na(qtr),
+      !is.na(half_seconds_remaining),
+      !is.na(wp),
+      !is.na(down),
+      !is.na(air_yards),
+      !is.na(defteam),
+      !is.na(yardline_100)
+    ) %>%
+    select(
+      passer_player_name,
+      passer_player_id,
+      defteam,
+      epa,
+      yards_gained,
+      first_down,
+      touchdown,
+      ydstogo,
+      down,
+      air_yards,
+      score_differential,
+      qtr,
+      half_seconds_remaining,
+      game_seconds_remaining,
+      wp,
+      yardline_100,
+      complete_pass
+    )
+}) %>%
+#DEFINES CLUTCH
+  mutate(
+    clutch = case_when(
+      abs(score_differential) <= 8 &
+      (qtr == 4 | half_seconds_remaining <= 150) &
+      wp > 0.2 & wp < 0.8 &
+      down %in% c(3, 4) ~ "Clutch",
+      TRUE ~ "Non-Clutch"
+    ),
+    yards_over_sticks = yards_gained - ydstogo,
+    conversion = as.integer(
+      first_down == 1 | touchdown == 1 | yards_gained >= ydstogo
+    )
+  )
+
+data = data %>%
+  mutate(clutch = factor(clutch, levels = c("Non-Clutch", "Clutch")))
+
+#FILTERS QBS WITH VERY LIMITED DATA
+valid_qbs = data %>%
+  count(passer_player_id, clutch) %>%
+  tidyr::pivot_wider(names_from = clutch, values_from = n, values_fill = 0) %>%
+  filter(Clutch >= 20, `Non-Clutch` >= 50) %>%
+  pull(passer_player_id)
+
+data = data %>%
+  filter(passer_player_id %in% valid_qbs)
+```
+
+## EDA I: Clutch vs Non-Clutch Play Counts by QB
+
+```{r, echo=FALSE, message=FALSE, fig.width=5, fig.height=3, fig.align='center'}
+qb_counts = data %>%
+  group_by(passer_player_id, passer_player_name, clutch) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  pivot_wider(names_from = clutch, values_from = n, values_fill = 0) %>%
+  mutate(total = Clutch + `Non-Clutch`)
+
+label_qbs = qb_counts %>%
+  arrange(desc(total)) %>%
+  slice_head(n = 8)
+
+library(ggrepel)
+
+ggplot(qb_counts, aes(x = `Non-Clutch`, y = Clutch)) +
+  geom_point(alpha = 0.5) +
+  
+  geom_text_repel(
+    data = label_qbs,
+    aes(label = passer_player_name),
+    size = 2,
+    max.overlaps = Inf
+  ) +
+  geom_smooth(method = "lm", se = FALSE, linetype = "dashed", color = "red") +
+  labs(
+    x = "Non-Clutch Plays",
+    y = "Clutch Plays"
+  ) +
+  
+  theme_minimal()
+
+```
+
+First, we wanted to understand how frequently clutch plays actually occur relative to non-clutch plays, and we especially want to make sure the balance holds for QBs that have played a high amount of snaps. The strong linear relationship also tells us that our clutch definition isn't arbitrarily rare as QBs see roughly the same proportion of high-leverage situations regardless of how often they play, which gives us a balanced dataset to work with. This is particularly important for our multilevel models, where estimation of QB-specific random effects requires enough data to be useful.
+
+## EDA II: QB Completion Rate in Clutch vs Non-Clutch Situations
+
+```{r, echo=FALSE, message=FALSE, fig.width=5, fig.height=3, fig.align='center'}
+pbp_pass = data
+qb_completion <- pbp_pass %>%
+  group_by(passer_player_id, clutch) %>%
+  summarise(
+    completion_rate = mean(complete_pass, na.rm = TRUE),
+    attempts = n(),
+    .groups = "drop"
+  ) %>%
+  filter(attempts >= 50)
+
+ggplot(qb_completion, aes(x = clutch, y = completion_rate, fill = clutch)) +
+  geom_boxplot(alpha = 0.7, outlier.alpha = 0.3, width = 0.5) +
+  geom_jitter(width = 0.15, alpha = 0.4, size = 1) +
+  stat_summary(fun = mean, geom = "point", shape = 23, size = 3, fill = "white") +
+  scale_fill_manual(values = c("Clutch" = "red", "Non-Clutch" = "blue")) +
+  labs(
+    x = "",
+    y = "Completion Percentage"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(face = "bold"),
+    plot.subtitle = element_text(size = 10),
+    panel.grid.minor = element_blank()
+  )
+```
+
+One of the most important metrics of QB success if whether they are accurate or not. As such, we wanted to analyze completion rates in clutch and non-clutch environments. Completion rates seem to drop from 64% in non-clutch environments to 58% in clutch environments, which indicates that pressure seems to have some effect on accuracy. However, the clutch distribution is noticeably wider, with some QBs completing nearly 80% of passes and others below 40%. This directly motivates our first method of the multi-level logistic model being applied for estimated pass completion probability where we test whether this population-level drop is statistically significant.
+
+## EDA III: Average Yards Over Sticks (YOS) by Yards to Go
+
+```{r, echo=FALSE, fig.width=5, fig.height=3, fig.align='center'}
+eda_data_filtered = data %>%
+  filter(passer_player_name %in% qb_counts$passer_player_name)
+
+plot_data = eda_data_filtered %>%
+  group_by(ydstogo, clutch) %>%
+  summarise(
+    mean_yos = mean(yards_over_sticks, na.rm = TRUE),
+    n = n(),
+    .groups = "drop"
+  ) %>%
+  filter(n >= 30)
+
+ggplot(plot_data, aes(x = ydstogo, y = mean_yos, color = clutch)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  labs(
+    x = "Yards to Go",
+    y = "Average Yards Over Sticks",
+    color = ""
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+Both clutch and non-clutch Yards over Sticks Decreased as Yards To Go increased, which makes intuitive sense as the farther you need to travel, the hard it is to get to your goal. What's most interesting is that the clutch line is above the non-clutch line in a few instances, which may indicate that QBs are efficient in high-leverage long-yardage situations. This EDA motivates our GAM approach to understand conversion odds in clutch moments as well as QB passing efficiency across the board.
+
+## EDA IV: Clutch vs Non-Clutch Average EPA by QB
+
+```{r, echo=FALSE, fig.width=5, fig.height=3, fig.align='center'}
+data = data %>%
+  group_by(passer_player_id) %>%
+  mutate(passer_player_name = first(passer_player_name)) %>%
+  ungroup()
+
+qb_epa = data %>%
+  group_by(passer_player_id, passer_player_name, clutch) %>%
+  summarise(mean_epa = mean(epa, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = clutch, values_from = mean_epa) %>%
+  mutate(diff = Clutch - `Non-Clutch`)
+
+top_diff = qb_epa %>%
+  arrange(desc(abs(Clutch - `Non-Clutch`))) %>%
+  slice_head(n = 8)
+
+top_avg = qb_epa %>%
+  mutate(avg_epa = (Clutch + `Non-Clutch`) / 2) %>%
+  arrange(desc(avg_epa)) %>%
+  slice_head(n = 15)
+
+label_qbs = bind_rows(top_diff, top_avg) %>%
+  distinct(passer_player_name, .keep_all = TRUE)
+
+library(ggrepel)
+
+ggplot(qb_epa, aes(x = `Non-Clutch`, y = Clutch)) +
+  geom_point(alpha = 0.5) +
+  
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+  
+  geom_text_repel(
+    data = label_qbs,
+    aes(label = passer_player_name),
+    size = 2.5,
+    max.overlaps = Inf
+  ) +
+  
+  labs(
+    x = "Average EPA (Non-Clutch)",
+    y = "Average EPA (Clutch)"
+  ) +
+  
+  theme_minimal()
+```
+
+When assessing average EPA across clutch and non-clutch situations, we notice that most QBs cluster near the diagonal which indicates that clutch and non-clutch EPA tracks the same for most players. However, some players such as Kenny pickett and Jay Campbell appear to be strong outliers, performing much better in the clutch than their baslineline levels. To formally test whether QB EPA varies in clutch and non-clutch situations, we instituted a hierarchical model on Method 3 that accounts for play difficulty, quarterback heterogeneity, and defensive strength.
+
+# Methods
+
+## Method I: Multilevel Model for QB Completion Percentage - Saraj Dhillon
+
+Our central question is whether “clutch” quarterback performance reflects a true, repeatable skill or is driven by random variation. Specifically, we test whether quarterbacks systematically perform differently in high-leverage situations after accounting for key contextual factors and differences in baseline ability.
+
+We model pass completion as a binary outcome, where each observation corresponds to a single passing play. Let $Y_{ij}$ denote whether pass $i$ thrown by quarterback $j$ is completed:
+\[
+Y_{ij} = \begin{cases} 
+1 & \text{if completed} \\
+0 & \text{otherwise}
+\end{cases}
+\]
+
+We estimate a multilevel logistic regression:
+\[
+\text{logit}\big( \mathbb{P}(Y_{ij} = 1) \big) = \beta_0 + \beta_1 \cdot \text{Clutch}_{ij} + \boldsymbol{\beta}_2^\top \text{X}_{ij} + u_j + v_j \cdot \text{Clutch}_{ij},
+\]
+where $\text{Clutch}_{ij}$ is a high-leverage indicator and $\text{X}_{ij}$ includes air yards and yards to go. The random effects $u_j$ and $v_j$ capture quarterback-specific baseline accuracy and deviations in clutch performance.
+
+We assume the random effects are normally distributed:
+\[
+\begin{pmatrix}
+u_j \\
+v_j
+\end{pmatrix}
+\sim \mathcal{N}
+\left(
+\begin{pmatrix}
+0 \\
+0
+\end{pmatrix},
+\begin{pmatrix}
+\sigma_u^2 & \sigma_u \sigma_v \\
+\sigma_u \sigma_v & \sigma_v^2
+\end{pmatrix}
+\right),
+\]
+and that pass outcomes are conditionally independent given covariates and random effects. We also assume air yards and yards to go adequately capture key aspects of play difficulty.
+
+A multilevel model is appropriate because the data contain repeated observations per quarterback, violating independence assumptions in standard regression. Random intercepts account for the baseline ability differences, while the random slopes then allow clutch effects to vary across players. This allows us to assess both the average clutch effect and whether individual quarterbacks consistently deviate from it.
+
+The main parameter of interest in this model is $\beta_1$, which represents average change in completion probability in clutch situations. A significant $\beta_1$ indicates a population-level clutch effect, while the random slopes $v_j$ identify player-specific deviations that may reflect repeatable skill.
+
+To evaluate robustness, we estimate three models of increasing complexity: (1) a naive model with only the clutch indicator, (2) a controlled model including air yards and yards to go, and (3) the multilevel model. Comparing these allows us to determine whether the clutch effect persists after controlling for context and player heterogeneity.
+
+Uncertainty is quantified through standard errors for fixed effects and variance components $(\sigma_u^2, \sigma_v^2)$, which capture heterogeneity in baseline performance and clutch responsiveness across quarterbacks.
+
+Finally, the model is limited by the available covariates. It does not account for factors such as receiver separation, defensive quality, or play design. Additionally, modeling clutch as a binary variable restricts our ability to capture varying degrees of pressure.
+
+## Method II: Situational Passing Efficiency via Yards Over Sticks (Nonlinear Model) - Mahi Saraf
+
+In order to provide a complementary perspective on whether quarterbacks exhibit a “clutch” effect, this third method is aimed at evaluating performance based on how effectively quarterbacks meet the immediate yardage requirements of a play. Instead of focusing on overall play value, this approach revolves around situational efficiency. Specifically, we are trying to see whether a quarterback generates sufficient yardage relative to what is needed for a first down.
+
+The primary outcome variable is Yards Over Sticks (YOS), defined as:
+
+$YOS_i = \text{Yards Gained}_i - \text{Yards To Go}_i$
+
+This metric helps capture how far a play exceeds or falls short of the line to gain. Positive values indicate that the quarterback achieved a first down or more, while negative values indicate that the play did not reach the required yardage. As a continuous measure, YOS allows us to evaluate not only whether a play was successful, but it also tells us by how much it succeeded or failed.
+
+To assess whether performance differs between clutch and non-clutch situations, we estimate a **generalized additive model (GAM)** with Yards Over Sticks as the outcome variable. The key explanatory variable is the clutch indicator.  This is important because the relationship between these variables and passing outcomes is unlikely to be linear. For example, the marginal difficulty of gaining additional yards increases at longer distances.
+
+In addition to the clutch indicator, the model controls for relevant contextual variables, including down, score differential, field position, and defensive team. Controlling for these variables allows the model to isolate the effect of clutch situations from underlying differences in play difficulty and game context.
+
+The coefficient on the clutch indicator captures the average shift in Yards Over Sticks between clutch and non-clutch situations, after accounting for nonlinear effects of play characteristics. A positive coefficient would indicate that quarterbacks, on average, exceed situational requirements by more in high-pressure moments, while a negative coefficient would suggest reduced performance under pressure. 
+
+To complement the continuous analysis, we also define a secondary binary outcome, **Conversion Success**, which equals one if the play results in a first down or touchdown and zero otherwise. A logistic regression model is used to evaluate whether the probability of converting a play differs between clutch and non-clutch situations. This provides an intuitive benchmark alongside the more detailed YOS-based analysis.
+
+To further investigate which quarterbacks are less affected by high-pressure situations, we extend the model to estimate quarterback specific clutch effects. While the baseline model captures the average effect of clutch situations across all quarterbacks, it does not distinguish how individual players respond to pressure. To address this, we allow the effect of the clutch indicator to vary by quarterback using a random effects specification within the generalized additive model framework. This approach produces an adjusted clutch effect for each quarterback, measuring how their performance in clutch situations differs from their own baseline after controlling for play difficulty and game context. By comparing these quarterback-specific effects, we can identify which players experience the smallest decline (or even improvement) in Yards Over Sticks under pressure. 
+
+## Method III: EPA Linear Heierarchical Model with Clutch Interaction - Krishna Purimetla
+
+To evaluate whether NFL quarterbacks exhibit a "clutch" effect, we model play-level performance using \textit{Expected Points Added (EPA)} as the outcome. EPA provides a continuous, context-adjusted measure of play success. A binary indicator defines clutch situations based on game context (score, time pressure, and importance), consistent with earlier methods. :contentReference[oaicite:0]{index=0}
+
+We estimate a sequence of models to isolate the effect of clutch situations.
+
+\paragraph{Naive Model}
+\[
+\text{EPA}_i = \beta_0 + \gamma \cdot \text{clutch}_i + \varepsilon_i
+\]
+
+\paragraph{Controlled Model (Play Difficulty)}
+\[
+\text{EPA}_i = \beta_0 + \gamma \cdot \text{clutch}_i + \beta_1 \cdot \text{ydstogo}_i + \varepsilon_i
+\]
+
+\paragraph{Controlled Model (Defensive Effects)}
+\[
+\text{EPA}_i = \beta_0 + \gamma \cdot \text{clutch}_i + \beta_1 \cdot \text{ydstogo}_i + \delta_{\text{DEF}[i]} + \varepsilon_i
+\]
+
+\paragraph{Hierarchical Model}
+\[
+\text{EPA}_i = \beta_0 + \gamma \cdot \text{clutch}_i + \beta_1 \cdot \text{ydstogo}_i + u_{\text{QB}[i]} + v_{\text{QB}[i]} \cdot \text{clutch}_i + w_{\text{DEF}[i]} + \varepsilon_i
+\]
+
+The hierarchical specification allows both baseline performance and clutch responsiveness to vary by quarterback while controlling for opponent strength, making it well-suited to our question of player-specific clutch effects.
+
+Some of our main modeling assumptions include that: Errors are normally distributed ($\varepsilon_i \sim \mathcal{N}(0, \sigma^2)$), Random effects (QB and defense) follow normal distributions, Conditional independence of plays given covariates and random effects, A linear relationship between EPA and included variables is appropriate. These modeling assumptions may not be perfectly appropriate to model the real world, and they must be heavily considered in our interpretations. 
+
+We can compare our models based on how the estimated clutch coefficient changes across specifications. This allows us to assess whether controlling for play difficulty, defense, and player heterogeneity meaningfully alters the magnitude or significance of the clutch effect.
+
+Uncertainty is quantified in two ways. For linear models, we report standard errors and p-values for the clutch coefficient. For the hierarchical model, we use bootstrap resampling (B = 20 due to computational limitations) to estimate distributions of quarterback-specific clutch effects by repeatedly refitting the model on resampled data.
+
+This approach captures both sampling variability and uncertainty in player-level estimates, which is particularly important given the hierarchical structure. Due to computational constraints, the number of bootstrap iterations is limited.
+
+Key limitations of this method include the use of yards to go as a simplified measure of play difficulty, team-level (rather than granular) defensive effects, and the assumption of linearity. Additionally, limited bootstrap iterations may reduce stability of uncertainty estimates.
+
+# Results
+
+## Results I: Multilevel Model for QB Performance - Saraj Dhillon
+
+```{r, echo=FALSE, fig.width=5, fig.height=3, fig.align='center'}
+model_naive <- glm(
+  complete_pass ~ clutch,
+  data = pbp_pass,
+  family = binomial
+)
+
+model_control <- glm(
+  complete_pass ~ clutch + air_yards + log(ydstogo),
+  data = pbp_pass,
+  family = binomial
+)
+
+model_multilevel <- glmer(
+  complete_pass ~ clutch + air_yards + log(ydstogo) +
+    (1 + clutch | passer_player_id),
+  data = pbp_pass,
+  family = binomial
+)
+
+naive_coef <- tidy(model_naive) %>%
+  filter(term == "clutchClutch") %>%
+  mutate(model = "Naive")
+
+control_coef <- tidy(model_control) %>%
+  filter(term == "clutchClutch") %>%
+  mutate(model = "Controlled")
+
+multilevel_coef <- tidy(model_multilevel, effects = "fixed") %>%
+  filter(term == "clutchClutch") %>%
+  mutate(model = "Multilevel")
+
+model_comparison <- bind_rows(naive_coef, control_coef, multilevel_coef) %>%
+  select(model, estimate, std.error, p.value) %>%
+  mutate(
+    prob_effect = plogis(estimate) - 0.5,
+    ci_lower = estimate - 1.96 * std.error,
+    ci_upper = estimate + 1.96 * std.error
+  )
+
+kable(
+  model_comparison %>% select(model, estimate, std.error, ci_lower, ci_upper, p.value, prob_effect),
+  digits = 3,
+  col.names = c("Model", "Estimate", "Std. Error", "95% CI Lower", "95% CI Upper", "p-value", "Prob. Effect"),
+  caption = "Comparison of Clutch Effect Across Model Specifications with 95% Confidence Intervals"
+)
+
+qb_effects <- tidy(model_multilevel, effects = "ran_vals") %>%
+  filter(group == "passer_player_id") %>%
+  select(qb = level, term, estimate) %>%
+  pivot_wider(names_from = term, values_from = estimate) %>%
+  rename(
+    intercept = `(Intercept)`,
+    clutch_effect = `clutchClutch`
+  )
+```
+
+### Distribution of QB-Specific Clutch Effects
+
+```{r, echo=FALSE, fig.width=5, fig.height=3, fig.align='center'}
+ggplot(qb_effects, aes(x = clutch_effect)) +
+  geom_histogram(
+    bins = 30,
+    fill = "blue",
+    color = "white",
+    alpha = 0.85
+  ) +
+  geom_vline(
+    xintercept = mean(qb_effects$clutch_effect, na.rm = TRUE),
+    linetype = "dashed",
+    color = "red",
+    linewidth = 1
+  ) +
+  labs(
+    x = "Clutch Effect (Log-Odds)",
+    y = "Number of Quarterbacks"
+  ) +
+  theme_minimal(base_size = 16) +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(size = 14, margin = margin(b = 10)),
+    axis.title = element_text(size = 14),
+    axis.text = element_text(size = 12),
+    panel.grid.minor = element_blank()
+  )
+```
+
+As we can see above, the table reports clutch estimates for each of our three models of focus and in each case, we notice that the clutch coefficients are negative with an element of statistical significance, meaning that the possibility of high-leverage moments elevate or even having a neutral effect on a QB's play on average has been ruled out. The naive model shows the most negative coefficient, but in the controlled model, we notice that the coefficient is likewise negative and its 95% CI does not include 0, meaning that there is a genuine pressure related drop in QB completion percentage. Our model's estimate that this drop in percentage is likely anywhere from 4-7% on average. 
+
+Our histogram of QB-specific random slopes displays a distribution that is centered quite close to 0 with a fairly symmetric pattern, which indicates that quarterbacks on average neither systematically overcome nor are disproportionately hurt by pressure beyond the population-level drop captured by $\beta_{1}$ in our multi-level model. While there are a few quarterbacks in the tails, these outliers could be driven by small clutch sample sizes as opposed to their true abilities. When taken together, the summary output as well as the histogram suggest that a completion percentage drop under pressure is very real and often occurs at the population level. However, the notion of clutch as an individual and replicable skill is largely unfounded.
+
+## Results II: Situational Passing Efficiency via Yards Over Sticks (Nonlinear Model) - Mahi Saraf
+
+```{r, echo=FALSE}
+method3_data = eda_data_filtered %>%
+  mutate(
+    clutch = relevel(clutch, ref = "Non-Clutch"),
+    conversion_success = if_else(
+      first_down == 1 | touchdown == 1 | yards_gained >= ydstogo,
+      1,
+      0
+    )
+  )
+
+yos_gam = gam(
+  yards_over_sticks ~ clutch +
+    s(ydstogo) +
+    s(air_yards) +
+    s(yardline_100) +
+    down +
+    score_differential +
+    defteam,
+  data = method3_data,
+  method = "REML"
+)
+
+gam_coef_table = as.data.frame(summary(yos_gam)$p.table) %>%
+  tibble::rownames_to_column("Term") %>%
+  filter(
+    Term %in% c("(Intercept)", "clutchClutch", "down4", "score_differential")
+  ) %>%
+  rename(
+    Estimate = Estimate,
+    `Std. Error` = `Std. Error`,
+    `t-value` = `t value`,
+    `p-value` = `Pr(>|t|)`
+  ) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 4)))
+
+kable(
+  gam_coef_table,
+  caption = "Key Coefficients from GAM Predicting Yards Over Sticks",
+  digits = 4
+)
+```
+
+In order to analyze whether quarterbacks perform differently in clutch situations, we estimated a generalized additive model (GAM) using Yards Over Sticks (YOS) as the outcome variable. This was done while controlling for play difficulty and game context.
+
+From the table above, it can be seen that clutch situations are associated with a statistically significant decrease in situational passing efficiency. Specifically, we see that the coefficient on the clutch indicator is -0.336 (p = 0.0018) which suggests that, on average, pass plays in clutch situations fall approximately 0.34 yards shorter of the line to gain when they are compared to non-clutch plays. This analysis is true when we are holding yards to go, air yards, field position, down, score differential, and defensive team constant. The model provides evidence that quarterbacks are, on average, slightly less effective at meeting the required yardage threshold in high-pressure situations.
+
+```{r, echo = FALSE}
+conversion_model = glm(
+  conversion_success ~ clutch +
+    ydstogo +
+    air_yards +
+    yardline_100 +
+    down +
+    score_differential +
+    defteam,
+  data = method3_data,
+  family = binomial
+)
+
+conversion_table = as.data.frame(summary(conversion_model)$coefficients) %>%
+  tibble::rownames_to_column("Term") %>%
+  filter(
+    Term %in% c("(Intercept)", "clutchClutch", "ydstogo", "air_yards",
+                "yardline_100", "down4", "score_differential")
+  ) %>%
+  rename(
+    Estimate = Estimate,
+    `Std. Error` = `Std. Error`,
+    `z-value` = `z value`,
+    `p-value` = `Pr(>|z|)`
+  ) %>%
+  mutate(
+    `Odds Ratio` = exp(Estimate),
+    across(where(is.numeric), ~ round(.x, 4))
+  )
+
+kable(
+  conversion_table,
+  caption = "Key Coefficients from Logistic Regression Predicting Conversion Success",
+  digits = 4
+)
+
+```
+
+To assess whether clutch situations affect the likelihood of successfully converting a play, we estimate a logistic regression model with conversion success as the outcome variable, controlling for play difficulty and game context.
+
+The coefficient on the clutch indicator is negative but it not statistically significant (odds ratio = 0.963, p = 0.1085). This suggests that clutch situations are associated with approximately 3.7% lower odds of conversion compared to non-clutch situations, holding other factors constant. However, because this effect is not statistically significant at a 5% level, the model does not provide strong evidence that quarterbacks are more or less likely to convert plays in clutch situations.
+
+Overall, these results indicate that, after accounting for situational difficulty, there is no meaningful difference in conversion success between clutch and non-clutch plays, providing little support for a “clutch” effect in terms of achieving first downs or touchdowns.
+
+
+```{r,echo=FALSE, fig.width=5, fig.height=3, fig.align='center'}
+method3_data = eda_data_filtered %>%
+  mutate(
+    passer_player_name = factor(passer_player_name),
+    clutch = relevel(clutch, ref = "Non-Clutch"),
+    clutch_num = if_else(clutch == "Clutch", 1, 0),
+    yards_over_sticks = yards_gained - ydstogo
+  )
+
+# GAM with QB-specific clutch effects
+qb_yos_gam = gam(
+  yards_over_sticks ~ clutch +
+    s(ydstogo) +
+    s(air_yards) +
+    s(yardline_100) +
+    down +
+    score_differential +
+    defteam +
+    s(passer_player_name, by = clutch_num, bs = "re"),
+  data = method3_data,
+  method = "REML"
+)
+
+```
+
+```{r,echo=FALSE}
+# Compute QB-specific adjusted clutch effects with standard errors
+Xp_clutch = predict(
+  qb_yos_gam,
+  newdata = transform(method3_data, clutch = "Clutch", clutch_num = 1),
+  type = "lpmatrix"
+)
+
+Xp_non_clutch = predict(
+  qb_yos_gam,
+  newdata = transform(method3_data, clutch = "Non-Clutch", clutch_num = 0),
+  type = "lpmatrix"
+)
+
+Xp_diff = Xp_clutch - Xp_non_clutch
+
+pred_diff = as.vector(Xp_diff %*% coef(qb_yos_gam))
+se_diff = sqrt(rowSums((Xp_diff %*% vcov(qb_yos_gam)) * Xp_diff))
+
+qb_effects = method3_data %>%
+  mutate(
+    clutch_effect = pred_diff,
+    se = se_diff
+  ) %>%
+  group_by(passer_player_name) %>%
+  summarise(
+    adjusted_clutch_effect = mean(clutch_effect, na.rm = TRUE),
+    std_error = sqrt(mean(se^2, na.rm = TRUE)/n()),
+    clutch_plays = sum(clutch == "Clutch"),
+    non_clutch_plays = sum(clutch == "Non-Clutch"),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    lower_95 = adjusted_clutch_effect - 1.96 * std_error,
+    upper_95 = adjusted_clutch_effect + 1.96 * std_error
+  ) %>%
+  arrange(desc(adjusted_clutch_effect))
+```
+
+
+### Quarterbacks with the Least Negative Adjusted Clutch Effect
+
+```{r, echo=FALSE, warning = FALSE, message = FALSE, fig.width=5, fig.height=3, fig.align='center'}
+# Visualization
+ggplot(
+  qb_effects %>% slice_head(n = 15),
+  aes(
+    x = reorder(passer_player_name, adjusted_clutch_effect),
+    y = adjusted_clutch_effect
+  )
+) +
+  geom_col(fill = "steelblue") +
+  geom_errorbar(
+    aes(ymin = lower_95, ymax = upper_95),
+    width = 0.2
+  ) +
+  coord_flip() +
+  labs(
+    x = "Quarterback",
+    y = "Adjusted Clutch Effect (Yards Over Sticks)"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+In order to identify which quarterbacks are least negatively affected by clutch situations, we estimate quarterback-specific adjusted clutch effects using the GAM framework. This measures how each quarterback’s Yards Over Sticks changes in clutch situations relative to their own baseline, after controlling for play difficulty and game context. In the output, higher values indicate a smaller decline or sometimes even improvement in performance under pressure.
+
+From the results above, we can see a clear variation across quarterbacks. Dak Prescott (1.054), Jalen Hurts (0.961), and Eli Manning (0.736) exhibit the largest positive adjusted clutch effects, indicating that they perform relatively better in clutch situations compared to their own non-clutch baseline. Other quarterbacks such as Matt Ryan and Drew Brees also seem to show strong positive effects which suggests that they experience relatively smaller declines in performance under pressure.
+
+It is also important to note that the estimated standard errors are small, and the corresponding confidence intervals are relatively tight, which is indicative of the fact that these estimates are precise and not driven by noise. For example, Prescott’s adjusted clutch effect is estimated at 1.054 with a narrow 95% confidence interval, suggesting a consistently stronger relative performance in clutch situations.
+
+Overall, we can see that while the aggregate results earlier showed little evidence of a strong clutch effect, this quarterback-specific analysis highlights meaningful heterogeneity. It is clear that some quarterbacks appear to be less negatively impacted by high-pressure situations than others, even after accounting for play context and difficulty.
+
+
+## Results III: EPA Linear Heierarchical Model with Clutch Interaction - Krishna Purimetla
+
+```{r, echo=FALSE}
+model_naive = lm(epa ~ clutch, data = data)
+
+naive_tbl = tidy(model_naive) %>%
+  filter(grepl("clutch", term)) %>%
+  mutate(
+    Model = "Naive",
+    Comparison = "Clutch vs Non-Clutch"
+  ) %>%
+  select(
+    Model,
+    Comparison,
+    Estimate = estimate,
+    `Std. Error` = std.error,
+    `p-value` = p.value
+  )
+```
+
+
+```{r, echo=FALSE}
+model_control = lm(
+  epa ~ clutch + ydstogo,
+  data = data
+)
+
+control_tbl = tidy(model_control) %>%
+  filter(grepl("clutch", term)) %>%
+  mutate(
+    Model = "Play Difficulty",
+    Comparison = "Clutch vs Non-Clutch"
+  ) %>%
+  select(
+    Model,
+    Comparison,
+    Estimate = estimate,
+    `Std. Error` = std.error,
+    `p-value` = p.value
+  )
+```
+
+
+```{r, echo=FALSE}
+model_def = lm(
+  epa ~ clutch + ydstogo + factor(defteam),
+  data = data
+)
+
+def_tbl = tidy(model_def) %>%
+  filter(grepl("clutch", term)) %>%
+  mutate(
+    Model = "Play + Defense",
+    Comparison = "Clutch vs Non-Clutch"
+  ) %>%
+  select(
+    Model,
+    Comparison,
+    Estimate = estimate,
+    `Std. Error` = std.error,
+    `p-value` = p.value
+  )
+```
+
+```{r, echo=FALSE}
+bind_rows(naive_tbl, control_tbl, def_tbl) %>%
+  kable(digits = 4)
+```
+
+Across all three of these model specifications, we find consistent evidence of a negative clutch effect on quarterback performance. In the baseline hierarchical model, the estimated difference between clutch and non-clutch situations is $-0.0343$ (SE = 0.0158, $p = 0.0297$), indicating a small but statistically significant decline in performance under pressure.
+
+After adjusting for play difficulty using yards-to-go, the magnitude of this effect increases to $-0.0462$ (SE = 0.0158, $p = 0.0034$). Further controlling for both play and defensive context yields a nearly identical estimate of $-0.0468$ (SE = 0.0158, $p = 0.003$). The stability of these estimates across specifications suggests that the negative clutch effect is not driven by differences in play difficulty or defensive strength, and is a systematic average worse performance across quarterbacks during clutch situations (in line with our findings on our previous methods).
+
+
+```{r, echo=FALSE, message=FALSE}
+library(lme4)
+model_hier = lmer(
+  epa ~ clutch + ydstogo +
+    (1 + clutch | passer_player_id) +   # QB intercept + clutch slope
+    (1 | defteam),                      # defense strength
+  data = data,
+  REML = FALSE
+)
+```
+
+
+```{r, echo=FALSE, message=FALSE}
+library(lme4)
+library(dplyr)
+library(purrr)
+
+B = 20
+
+boot_results = map_dfr(1:B, function(b) {
+
+  boot_data = data %>%
+    slice_sample(n = nrow(data), replace = TRUE)
+
+  model_boot = lmer(
+    epa ~ clutch + ydstogo +
+      (1 + clutch | passer_player_id) +
+      (1 | defteam),
+    data = boot_data,
+    REML = FALSE
+  )
+  
+  beta_clutch = fixef(model_boot)["clutchClutch"]
+  
+  re = ranef(model_boot)$passer_player_id
+  
+  tibble(
+    passer_player_id = rownames(re),
+    clutch_effect = beta_clutch + re[, "clutchClutch"],
+    boot_id = b
+  )
+})
+```
+
+```{r, echo=FALSE}
+boot_results = boot_results %>%
+  mutate(passer_player_id = as.character(passer_player_id)) %>%
+  left_join(
+    data %>%
+      mutate(passer_player_id = as.character(passer_player_id)) %>%
+      select(passer_player_id, passer_player_name) %>%
+      distinct(),
+    by = "passer_player_id"
+  )
+
+top_bottom_qbs = boot_results %>%
+  group_by(passer_player_name) %>%
+  summarise(mean_effect = mean(clutch_effect, na.rm = TRUE)) %>%
+  arrange(mean_effect) %>%
+  {
+    bind_rows(
+      slice_head(., n = 10),   # bottom 10
+      slice_tail(., n = 10)    # top 10
+    )
+  } %>%
+  pull(passer_player_name)
+
+boot_plot = boot_results %>%
+  filter(passer_player_name %in% top_bottom_qbs)
+```
+
+### Hierarchical Bootstrap Distributions of QB Clutch Effects
+
+```{r, echo=FALSE, message=FALSE,fig.width=5, fig.height=3, fig.align='center'}
+library(ggridges)
+library(ggplot2)
+
+boot_plot$passer_player_name = factor(
+  boot_plot$passer_player_name,
+  levels = boot_plot %>%
+    group_by(passer_player_name) %>%
+    summarise(m = mean(clutch_effect)) %>%
+    arrange(m) %>%
+    pull(passer_player_name)
+)
+
+ggplot(boot_plot, aes(x = clutch_effect, y = passer_player_name)) +
+  geom_density_ridges(
+    fill = "steelblue",
+    alpha = 0.8,
+    scale = 1.2
+  ) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "red") +
+  labs(
+    x = "Clutch Effect (EPA difference)",
+    y = "Quarterback",
+  ) +
+  theme_minimal()
+```
+
+To examine variation across players, and find the "clutchest quarterback," we analyze bootstrap distributions of quarterback-specific clutch effects from the full hierarchical model. These distributions reveal heterogeneity in how quarterbacks respond to high-pressure situations, especially when comparing those in the top end to those in the bottom end.
+
+Most quarterbacks exhibit distributions centered below zero, consistent with the overall finding that performance tends to decline in clutch situations. However, a subset of quarterbacks have distributions closer to or above zero, suggesting they are less negatively affected or may even improve under pressure.
+
+Importantly, however, many of the bootstrap distributions are relatively wide and often overlap zero, indicating considerable uncertainty in individual-level estimates. This suggests that while differences in clutch performance exist across quarterbacks, they are not always statistically distinguishable.
+
+That being said, as we can see in the figure, top quarterbacks include K.Pickett, J.Campbell, P. Mahomes, J.Hurts, J.McCown, D.Prescott and B. Roethlisberger each have their 95% confidence intervals above zero, indicating that there is significant evidence showing that they perform better under pressure compared to their baseline skill.
+
+Overall, these results highlight that the average negative clutch effect player-level variation, but also that strong conclusions about individual quarterbacks should still be made cautiously due to the uncertainty.
+
+# Discussion
+
+Across all three methods, we find consistent evidence that quarterbacks perform worse on average in high-leverage situations, though some players appear to perform relatively better depending on how success is measured. 
+
+Method I shows a statistically significant negative clutch effect on completion probability (a 4–7 percentage point drop), with QB-specific variation tightly centered around zero, suggesting pressure affects most quarterbacks similarly. Method III reinforces this at the EPA level, where all non-hierarchical models show a significant negative clutch effect. While the hierarchical EPA model identifies some individual variation (such as Kenny Pickett and others as a positive outlier) these estimates carry uncertainty, limiting strong player-level conclusions. Method II presents a more nuanced result: clutch situations reduce Yards Over Sticks, but the decrease in conversion success is small and not statistically significant. The GAM-based rankings still show some spread (e.g., Prescott and Hurts), suggesting some quarterbacks may genuinely handle pressure better.
+
+There are several limitations to our approach. First, clutch is modeled as a binary variable, which oversimplifies the varying degrees of game leverage; a continuous leverage index would better capture this nuance. Second, important contextual variables—such as playoff status, pass rush intensity, and play design—are omitted and could bias estimates of clutch performance. Finally, computational constraints limited the extent of bootstrapping, model complexity, and number of covariates included.
+
+For future work, a key improvement would be replacing the binary clutch indicator with a continuous leverage measure to better model how performance changes across situations. A valuable extension would be incorporating Next Gen tracking data, allowing us to include features such as receiver separation, pass rush pressure, and time to throw, which could help disentangle true quarterback skill from situational factors.
+
